@@ -10,6 +10,15 @@
 #include "NuiApi.h"
 #include "ImageRenderer.h"
 
+#define MAX_PLAYER_INDEX    6
+
+enum DEPTH_TREATMENT
+{
+	CLAMP_UNRELIABLE_DEPTHS,
+	TINT_UNRELIABLE_DEPTHS,
+	DISPLAY_ALL_DEPTHS,
+};
+
 class CDepthBasics
 {
     static const int        cDepthWidth  = 640;
@@ -72,6 +81,34 @@ private:
     HANDLE                  m_hNextDepthFrameEvent;
 
     BYTE*                   m_depthRGBX;
+	///////////////////////////////////
+	//Code from NuiImageBuffer
+	DEPTH_TREATMENT     m_depthTreatment;
+
+
+	bool m_nearMode;
+	/// <summary>
+	/// Initialize the depth-color mapping table.
+	/// </summary>
+	void InitDepthColorTable();
+
+	/// <summary>
+	/// Calculate intensity of a certain depth
+	/// </summary>
+	/// <param name="depth">A certain depth</param>
+	/// <returns>Intensity calculated from a certain depth</returns>
+	BYTE GetIntensity(int depth);
+
+	/// <summary>
+	/// Set color value
+	/// </summary>
+	/// <param name="pColor">The pointer to the variable to be set with color</param>
+	/// <param name="red">Red component of the color</param>
+	/// <param name="green">Green component of the color</parma>
+	/// <param name="blue">Blue component of the color</param>
+	/// <param name="alpha">Alpha component of the color</param>
+	inline void SetColor(UINT* pColor, BYTE red, BYTE green, BYTE blue, BYTE alpha = 255);
+	//////////////////////////////////
 
     /// <summary>
     /// Main processing function
@@ -94,4 +131,10 @@ private:
     /// </summary>
     /// <param name="szMessage">message to display</param>
     void                    SetStatusMessage(WCHAR* szMessage);
+
+private:
+	static const BYTE    m_intensityShiftR[MAX_PLAYER_INDEX + 1];
+	static const BYTE    m_intensityShiftG[MAX_PLAYER_INDEX + 1];
+	static const BYTE    m_intensityShiftB[MAX_PLAYER_INDEX + 1];
+	UINT m_depthColorTable[MAX_PLAYER_INDEX + 1][USHRT_MAX + 1];
 };

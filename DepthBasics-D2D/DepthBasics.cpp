@@ -6,8 +6,30 @@
 
 #include "stdafx.h"
 #include <strsafe.h>
+#include <cmath>
 #include "DepthBasics.h"
 #include "resource.h"
+
+
+#define MIN_DEPTH                   400
+#define MAX_DEPTH                   16383
+#define UNKNOWN_DEPTH               0
+#define UNKNOWN_DEPTH_COLOR         0x003F3F07
+#define TOO_NEAR_COLOR              0x001F7FFF
+#define TOO_FAR_COLOR               0x007F0F3F
+#define NEAREST_COLOR               0x00FFFFFF
+
+#define COLOR_INDEX_BLUE            0
+#define COLOR_INDEX_GREEN           1
+#define COLOR_INDEX_RED             2
+#define COLOR_INDEX_ALPHA           3
+#define BYTES_PER_PIXEL_RGB         4
+
+#define BYTES_PER_PIXEL_DEPTH sizeof(NUI_DEPTH_IMAGE_PIXEL)
+
+const BYTE CDepthBasics::m_intensityShiftR[] = { 0, 2, 0, 2, 0, 0, 2 };
+const BYTE CDepthBasics::m_intensityShiftG[] = { 0, 2, 2, 0, 2, 0, 0 };
+const BYTE CDepthBasics::m_intensityShiftB[] = { 0, 0, 2, 2, 0, 2, 0 };
 
 /// <summary>
 /// Entry point for the application
@@ -32,9 +54,12 @@ CDepthBasics::CDepthBasics() :
     m_hNextDepthFrameEvent(INVALID_HANDLE_VALUE),
     m_pDepthStreamHandle(INVALID_HANDLE_VALUE),
     m_bNearMode(false),
-    m_pNuiSensor(NULL)
+    m_pNuiSensor(NULL),
+	m_depthTreatment(CLAMP_UNRELIABLE_DEPTHS),
+	m_nearMode(false)
 {
     // create heap storage for depth pixel data in RGBX format
+	InitDepthColorTable();
     m_depthRGBX = new BYTE[cDepthWidth*cDepthHeight*cBytesPerPixel];
 }
 
@@ -351,16 +376,23 @@ void CDepthBasics::ProcessDepth()
         int maxDepth = (nearMode ? NUI_IMAGE_DEPTH_MAXIMUM_NEAR_MODE : NUI_IMAGE_DEPTH_MAXIMUM) >> NUI_IMAGE_PLAYER_INDEX_SHIFT;
 
         BYTE * rgbrun = m_depthRGBX;
-        const NUI_DEPTH_IMAGE_PIXEL * pBufferRun = reinterpret_cast<const NUI_DEPTH_IMAGE_PIXEL *>(LockedRect.pBits);
+		
+		const NUI_DEPTH_IMAGE_PIXEL * pBufferRun = reinterpret_cast<const NUI_DEPTH_IMAGE_PIXEL *>(LockedRect.pBits);
 
         // end pixel is start + width*height - 1
         const NUI_DEPTH_IMAGE_PIXEL * pBufferEnd = pBufferRun + (cDepthWidth * cDepthHeight);
+
+		USHORT minReliableDepth = (m_nearMode ? NUI_IMAGE_DEPTH_MINIMUM_NEAR_MODE : NUI_IMAGE_DEPTH_MINIMUM) >> NUI_IMAGE_PLAYER_INDEX_SHIFT;
+		USHORT maxReliableDepth = (m_nearMode ? NUI_IMAGE_DEPTH_MAXIMUM_NEAR_MODE : NUI_IMAGE_DEPTH_MAXIMUM) >> NUI_IMAGE_PLAYER_INDEX_SHIFT;
 
         while ( pBufferRun < pBufferEnd )
         {
             // discard the portion of the depth that contains only the player index
             USHORT depth = pBufferRun->depth;
+			USHORT index = pBufferRun->playerIndex;
 
+			//USHORT depth = NuiDepthPixelToDepth(pBufferRun->depth);
+			//USHORT index = NuiDepthPixelToPlayerIndex(pBufferRun->depth);
             // To convert to a byte, we're discarding the most-significant
             // rather than least-significant bits.
             // We're preserving detail, although the intensity will "wrap."
@@ -368,20 +400,54 @@ void CDepthBasics::ProcessDepth()
 
             // Note: Using conditionals in this loop could degrade performance.
             // Consider using a lookup table instead when writing production code.
-            BYTE intensity = static_cast<BYTE>(depth >= minDepth && depth <= maxDepth ? depth % 256 : 0);
-
+            //BYTE intensity = static_cast<BYTE>(depth >= minDepth && depth <= maxDepth ? depth % 256 : 0);
+			BYTE r;
+			BYTE g;
+			BYTE b;
+			if (index == 0 && depth == 0) {
+				//Unknown Depth
+				r = 63;
+				g = 63;
+				b = 7;
+			} else  if (index == 0 && depth < minReliableDepth) {
+				//Too Near
+				r = 31;
+				g = 127;
+				b = 255;
+			} else if (index == 0 && depth > maxReliableDepth && depth <= USHRT_MAX) {
+				//Too Far
+				r = 127;
+				g = 15;
+				b = 63;
+			} else {
+				BYTE intensity = GetIntensity(depth);
+				r = intensity >> m_intensityShiftR[index];
+				g = intensity >> m_intensityShiftG[index];
+				b = intensity >> m_intensityShiftB[index];
+			}
+			//BYTE *
             // Write out blue byte
-            *(rgbrun++) = intensity;
-
-            // Write out green byte
-            *(rgbrun++) = intensity;
-
-            // Write out red byte
-            *(rgbrun++) = intensity;
+            //*(rgbrun++) = intensity;
+			*(rgbrun++) = b;
+            
+			// Write out green byte
+            //*(rgbrun++) = intensity;
+			*(rgbrun++) = g;
+          
+			// Write out red byte
+            //*(rgbrun++) = intensity;
+			*(rgbrun++) = r;
+			
+			//*rgbrun = m_depthColorTable[index][depth];
+			//rgbrun++;
+			//rgbrun++;
+			//rgbrun++;
+			
 
             // We're outputting BGR, the last byte in the 32 bits is unused so skip it
             // If we were outputting BGRA, we would write alpha here.
-            ++rgbrun;
+            //*(rgbrun++) = 1;
+			++rgbrun;
 
             // Increment our index into the Kinect's depth buffer
             ++pBufferRun;
@@ -408,4 +474,125 @@ ReleaseFrame:
 void CDepthBasics::SetStatusMessage(WCHAR * szMessage)
 {
     SendDlgItemMessageW(m_hWnd, IDC_STATUS, WM_SETTEXT, 0, (LPARAM)szMessage);
+}
+
+
+
+/// <summary>
+/// Initialize the depth-color mapping table.
+/// </summary>
+void CDepthBasics::InitDepthColorTable()
+{
+	// Get the min and max reliable depth
+	USHORT minReliableDepth = (m_nearMode ? NUI_IMAGE_DEPTH_MINIMUM_NEAR_MODE : NUI_IMAGE_DEPTH_MINIMUM) >> NUI_IMAGE_PLAYER_INDEX_SHIFT;
+	USHORT maxReliableDepth = (m_nearMode ? NUI_IMAGE_DEPTH_MAXIMUM_NEAR_MODE : NUI_IMAGE_DEPTH_MAXIMUM) >> NUI_IMAGE_PLAYER_INDEX_SHIFT;
+
+	ZeroMemory(m_depthColorTable, sizeof(m_depthColorTable));
+
+	// Set color for unknown depth
+	m_depthColorTable[0][UNKNOWN_DEPTH] = UNKNOWN_DEPTH_COLOR;
+
+	switch (m_depthTreatment)
+	{
+	case CLAMP_UNRELIABLE_DEPTHS:
+		// Fill in the "near" portion of the table with solid color
+		for (int depth = UNKNOWN_DEPTH + 1; depth < minReliableDepth; depth++)
+		{
+			m_depthColorTable[0][depth] = TOO_NEAR_COLOR;
+		}
+
+		// Fill in the "far" portion of the table with solid color
+		for (int depth = maxReliableDepth + 1; depth <= USHRT_MAX; depth++)
+		{
+			m_depthColorTable[0][depth] = TOO_FAR_COLOR;
+		}
+		break;
+
+	case TINT_UNRELIABLE_DEPTHS:
+	{
+								   // Fill in the "near" portion of the table with a tinted gradient
+								   for (int depth = UNKNOWN_DEPTH + 1; depth < minReliableDepth; depth++)
+								   {
+									   BYTE intensity = GetIntensity(depth);
+									   BYTE r = intensity >> 3;
+									   BYTE g = intensity >> 1;
+									   BYTE b = intensity;
+									   SetColor(&m_depthColorTable[0][depth], r, g, b);
+								   }
+
+								   // Fill in the "far" portion of the table with a tinted gradient
+								   for (int depth = maxReliableDepth + 1; depth <= USHRT_MAX; depth++)
+								   {
+									   BYTE intensity = GetIntensity(depth);
+									   BYTE r = intensity;
+									   BYTE g = intensity >> 3;
+									   BYTE b = intensity >> 1;
+									   SetColor(&m_depthColorTable[0][depth], r, g, b);
+								   }
+	}
+		break;
+
+	case DISPLAY_ALL_DEPTHS:
+		minReliableDepth = MIN_DEPTH;
+		maxReliableDepth = MAX_DEPTH;
+
+		for (int depth = UNKNOWN_DEPTH + 1; depth < minReliableDepth; depth++)
+		{
+			m_depthColorTable[0][depth] = NEAREST_COLOR;
+		}
+		break;
+
+	default:
+		break;
+	}
+
+	for (USHORT depth = minReliableDepth; depth <= maxReliableDepth; depth++)
+	{
+		BYTE intensity = GetIntensity(depth);
+
+		for (int index = 0; index <= MAX_PLAYER_INDEX; index++)
+		{
+			BYTE r = intensity >> m_intensityShiftR[index];
+			BYTE g = intensity >> m_intensityShiftG[index];
+			BYTE b = intensity >> m_intensityShiftB[index];
+			SetColor(&m_depthColorTable[index][depth], r, g, b);
+		}
+	}
+}
+
+/// <summary>
+/// Calculate intensity of a certain depth
+/// </summary>
+/// <param name="depth">A certain depth</param>
+/// <returns>Intensity calculated from a certain depth</returns>
+BYTE CDepthBasics::GetIntensity(int depth)
+{
+	// Validate arguments
+	if (depth < MIN_DEPTH || depth > MAX_DEPTH)
+	{
+		return UCHAR_MAX;
+	}
+
+	// Use a logarithmic scale that shows more detail for nearer depths.
+	// The constants in this formula were chosen such that values between
+	// MIN_DEPTH and MAX_DEPTH will map to the full range of possible
+	// byte values.
+	const float depthRangeScale = 500.0f;
+	const int intensityRangeScale = 74;
+	return (BYTE)(~(BYTE)min(
+		UCHAR_MAX,
+		log((double)(depth - MIN_DEPTH) / depthRangeScale + 1) * intensityRangeScale));
+}
+
+
+void CDepthBasics::SetColor(UINT* pColor, BYTE red, BYTE green, BYTE blue, BYTE alpha)
+{
+	if (!pColor)
+		return;
+
+	BYTE* c = (BYTE*)pColor;
+	c[COLOR_INDEX_RED] = red;
+	c[COLOR_INDEX_GREEN] = green;
+	c[COLOR_INDEX_BLUE] = blue;
+	c[COLOR_INDEX_ALPHA] = alpha;
 }
